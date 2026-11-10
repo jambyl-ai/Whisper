@@ -189,6 +189,7 @@ class AnswererTests(unittest.TestCase):
         a.profile, a.docs, a.cfg = "", [], make_cfg()
         p = a.system_prompt()
         self.assertIn("ПРО КОГО", p)
+        self.assertIn("Ніколи не згадуй, що ти ШІ", p)
         self.assertIn("«X is…»", p)
         self.assertNotIn("від першої особи («I…», «Я…»).\nПравила", p)
 
