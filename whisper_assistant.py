@@ -161,7 +161,9 @@ DEFAULT_CONFIG = {
     "silence_seconds": 0.6,
     "max_phrase_seconds": 25,
     "partial_seconds": 0,              # як часто показувати живий текст (0 = авто: 1,2 с GPU, 3 с CPU)
-    "merge_gap_seconds": 2.0,          # пауза, після якої незакінчене речення все одно вважається завершеним
+    "turn_gap_seconds": 1.2,           # тиша, після якої репліка закінчена (якщо речення виглядає завершеним)
+    "unfinished_gap_seconds": 2.5,     # те саме, якщо речення обірване («What do you think about…»)
+    "slow_speech_wps": 1.8,            # повільніше за стільки слів/с — паузи чекаємо довше (до ×1,8)
     "min_rms": 0.006,
     "history_phrases": 20,
     "save_log": True,
@@ -258,6 +260,26 @@ def looks_like_question(text):
         return True
     words = re.findall(r"[\w'’-]+", t)
     return bool(words) and words[0] in QUESTION_WORDS
+
+
+CONTINUATION_WORDS = {
+    "and", "or", "but", "the", "a", "an", "of", "to", "in", "on", "at", "for", "with", "about", "from",
+    "because", "so", "that", "which", "who", "is", "are", "was", "were", "my", "your", "his", "her",
+    "their", "our", "like", "if", "when", "than", "then", "um", "uh", "erm",
+    "і", "й", "та", "а", "але", "що", "як", "в", "у", "на", "з", "із", "до", "про", "для", "бо", "тому",
+    "щоб", "який", "яка", "які", "коли", "якщо", "ну", "е", "еее",
+    "и", "но", "что", "с", "для", "потому", "чтобы", "который", "когда", "если"}
+
+
+def looks_unfinished(text):
+    """Речення, схоже, обірване: немає кінцевого розділового знака, «…», кома чи службове слово в кінці."""
+    t = text.rstrip(' "»”)\'')
+    if t.endswith(("...", "…", ",", "-", "—", ":")) or not t.endswith((".", "!", "?", "。")):
+        return True
+    if t.endswith("?"):       # «Where are you from?» — питання з прийменником у кінці закінчене
+        return False
+    words = re.findall(r"[\w'’-]+", t.lower())
+    return bool(words) and words[-1] in CONTINUATION_WORDS
 
 
 def sentence_done(text):
@@ -1098,13 +1120,25 @@ class App:
                 self.thinking_since = None
                 self.post("status", "Слухаю…")
 
+    def turn_gap(self, text, rate):
+        """Скільки тиші чекати, перш ніж вважати репліку закінченою."""
+        cfg = self.cfg
+        gap = float(cfg.get("unfinished_gap_seconds") or 2.5) if looks_unfinished(text) \
+            else float(cfg.get("turn_gap_seconds") or 1.2)
+        slow = float(cfg.get("slow_speech_wps") or 1.8)
+        if rate and rate < slow:            # повільний мовець робить довгі паузи посеред речення
+            gap *= min(1.8, slow / rate)
+        return gap
+
     def transcribe_loop(self, tr):
-        pending, pending_lang, t_first = "", "", 0.0   # незакінчене речення, що чекає продовження
-        last_item = time.monotonic()
-        gap = float(self.cfg.get("merge_gap_seconds") or 2.0)
+        """Фрази (шматки між короткими паузами) склеюються в одну репліку, доки мовець не замовкне
+        по-справжньому. Лише тоді репліка йде в історію і, якщо це питання, — на відповідь."""
+        pending, pending_lang, last_dt = "", "", 0.0
+        speaking, last_end, rate = False, time.monotonic(), None
+        silence_s = float(self.cfg.get("silence_seconds") or 0.6)
         while True:
             try:
-                items = [self.phrase_q.get(timeout=0.3)]
+                items = [self.phrase_q.get(timeout=0.1)]
             except queue.Empty:
                 items = []
             try:
@@ -1112,17 +1146,13 @@ class App:
                     items.append(self.phrase_q.get_nowait())
             except queue.Empty:
                 pass
-            now = time.monotonic()
-            if items:
-                last_item = now
-            elif pending and now - last_item > gap:     # довго тиша — віддаємо, що є
-                self.finish_phrase(pending, pending_lang, now - t_first)
-                pending = ""
-                continue
-            if not items:
-                continue
-            finals = [a for k, a in items if k == "final"]
-            live = items[-1][1] if items[-1][0] == "partial" else None
+            for kind, _a, t in items:
+                if kind == "start":
+                    speaking = True
+                elif kind in ("final", "end"):
+                    speaking, last_end = False, t
+            finals = [a for k, a, _t in items if k == "final"]
+            live = items[-1][1] if items and items[-1][0] == "partial" else None
 
             if finals:
                 audio = np.concatenate(finals) if len(finals) > 1 else finals[0]
@@ -1136,16 +1166,14 @@ class App:
                 finally:
                     if self.thinking_since is None:
                         self.post("status", "Слухаю…")
+                last_dt = time.monotonic() - t0
                 if text and not is_hallucination(text):
-                    if not pending:
-                        t_first = t0
+                    speech_s = max(0.6, len(audio) / SR - silence_s - 0.3)
+                    r = len(text.split()) / speech_s
+                    rate = r if rate is None else 0.6 * rate + 0.4 * r
                     pending = (pending + " " + text).strip() if pending else text
                     pending_lang = lang
-                    if sentence_done(pending) or len(pending) > 400:
-                        self.finish_phrase(pending, pending_lang, time.monotonic() - t0)
-                        pending = ""
-                    else:
-                        self.post("partial", pending, pending_lang)
+                    self.post("partial", pending, pending_lang)
                 elif not pending:
                     self.post("live_off")
 
@@ -1153,9 +1181,14 @@ class App:
                 try:
                     text, lang = tr.transcribe(live, partial=True)
                 except Exception:  # noqa: BLE001
-                    continue
+                    text = ""
                 if text and not is_hallucination(text):
                     self.post("partial", (pending + " " + text).strip(), lang)
+
+            if pending and not speaking and (time.monotonic() - last_end >= self.turn_gap(pending, rate)
+                                              or len(pending) > 600):
+                self.finish_phrase(pending, pending_lang, last_dt)
+                pending = ""
 
     def finish_phrase(self, text, lang, dt):
         with self.hist_lock:
@@ -1219,6 +1252,7 @@ class App:
         raw_every = self.cfg.get("partial_seconds")
         every = float(raw_every) if raw_every else {"cuda": 1.2, "cpu": 3.0}.get(tr.device, 0.0)
         silence = np.zeros(BLOCK, dtype=np.float32)
+        silence_s = float(self.cfg.get("silence_seconds") or 0.6)
         n, since_partial = 0, 0
         while True:
             try:
@@ -1232,9 +1266,16 @@ class App:
             if n % 3 == 0:
                 bars = min(10, int(rms / 0.01))
                 self.post("level", "рівень " + "▮" * bars + "·" * (10 - bars))
+            was_active = seg.active
             phrase = seg.feed(block, rms)
+            now = time.monotonic()
+            if seg.active and not was_active:
+                self.phrase_q.put(("start", None, now))
             if phrase is not None:
-                self.phrase_q.put(("final", phrase))
+                self.phrase_q.put(("final", phrase, now - silence_s))
+                since_partial = 0
+            elif was_active and not seg.active:            # надто короткий звук — фразу відкинуто
+                self.phrase_q.put(("end", None, now - silence_s))
                 since_partial = 0
             elif seg.active and every > 0:
                 since_partial += 1
@@ -1242,7 +1283,7 @@ class App:
                     since_partial = 0
                     cur = seg.current()
                     if cur is not None:
-                        self.phrase_q.put(("partial", cur))
+                        self.phrase_q.put(("partial", cur, now))
             else:
                 since_partial = 0
 
