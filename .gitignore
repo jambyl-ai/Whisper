@@ -1,0 +1,15 @@
+# особисте — не публікувати
+config.json
+про_мене.md
+знання/*
+!знання/README.md
+logs/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# система
+Thumbs.db
+desktop.ini

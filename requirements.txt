@@ -1,0 +1,6 @@
+faster-whisper>=1.1
+soundcard>=0.4.3
+numpy
+anthropic
+openai
+pypdf
