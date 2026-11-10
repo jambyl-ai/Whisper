@@ -72,6 +72,25 @@
 
 У git **не потрапляють**: `config.json` (ключі), `про_мене.md`, вміст папки `знання`, `logs`. Для нових користувачів у репозиторії лежать шаблони: `config.example.json` і `про_мене.example.md`.
 
+## Структура проєкту
+
+```
+whisper_assistant.py     точка входу (запускає 2_запустити.bat)
+assistant/
+  system.py              Windows: IPv4 першим, DLL NVIDIA, soundcard, COM
+  config.py              config.json, ключі, меню моделей
+  textproc.py            питання? речення обірване? галюцинація Whisper?
+  knowledge.py           профіль і папка «знання» (.docx, .pdf, .txt, .md)
+  audio.py               запис звуку ПК і нарізка на фрази за паузами
+  transcriber.py         Whisper: відеокарта, процесор або хмара Groq
+  llm.py                 моделі відповідей і запасна модель
+  pipeline.py            фонові потоки: звук → текст → репліки → відповіді
+  app.py                 вікно програми
+tests/                   автотести (без звуку, відеокарти й інтернету)
+```
+
+Тести запускаються так: `.venv\Scripts\python -m unittest discover tests`
+
 ## Як це працює
 
 - Звук записується через WASAPI loopback у спільному режимі. Програма робить копію того, що грає, тому навушники працюють як завжди, а Bluetooth-гарнітура не перемикається в режим Hands-Free.
