@@ -6,12 +6,13 @@ import tkinter as tk
 from collections import deque
 from datetime import datetime
 
-from .config import HERE, MODEL_CHOICES, key_for, load_config, save_model_choice
+from .config import HERE, MODEL_CHOICES, key_for, load_config, pick_fallback, save_model_choice
 from .llm import Answerer
 from .pipeline import Pipeline
+from .settings import SettingsWindow
+from .theme import ACCENT, BG, FG, MUTED, WARN
 
 
-BG, FG, MUTED, ACCENT, WARN = "#1e1f22", "#e6e6e6", "#9aa0a6", "#7ee787", "#e3b341"
 
 
 class App(Pipeline):
@@ -31,7 +32,11 @@ class App(Pipeline):
         if self.cfg["save_log"]:
             (HERE / "logs").mkdir(exist_ok=True)
             self.log_path = HERE / "logs" / f"{datetime.now():%Y-%m-%d_%H-%M}.txt"
+        self.settings_win = None
         self.build_ui()
+        if not any((self.cfg.get("keys") or {}).values()) and not self.cfg.get("api_key") \
+                and self.cfg["provider"] != "ollama":
+            self.root.after(400, lambda: self.open_settings(first_run=True))
         threading.Thread(target=self.worker, daemon=True).start()
         self.root.after(100, self.poll)
 
@@ -77,6 +82,7 @@ class App(Pipeline):
         mm.pack(side="left", padx=4)
         self.fb_var = tk.StringVar(value=self.fallback_text())
         tk.Label(mrow, textvariable=self.fb_var, bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(side="left")
+        tk.Button(mrow, text="⚙ Налаштування", command=self.open_settings, **btn).pack(side="right")
 
         sb = tk.Frame(self.root, bg="#17181a")
         sb.pack(side="bottom", fill="x")
@@ -138,16 +144,13 @@ class App(Pipeline):
         if not key and prov == self.cfg["provider"]:
             key = self.cfg["api_key"]
         if not key:
-            self.add_line(f"Немає ключа для {prov}: впишіть його в config.json → \"keys\" → \"{prov}\" "
-                          "і перезапустіть.", "info")
+            self.add_line(f"Немає ключа для {prov}: вставте його в «⚙ Налаштування».", "info")
             self.root.after(0, lambda: self.model_var.set(self.current_choice_label()))
             return
         keys = self.cfg.setdefault("keys", {})
         if self.cfg.get("api_key") and not keys.get(self.cfg["provider"]):
             keys[self.cfg["provider"]] = self.cfg["api_key"]
-        # запасна — інша безкоштовна модель, для якої є ключ (платну як запасну не ставимо)
-        fb = next(({"provider": p, "model": m} for _, p, m in MODEL_CHOICES
-                   if p != prov and p != "openai" and key_for(self.cfg, p)), {})
+        fb = pick_fallback(self.cfg, prov)
         self.cfg.update(provider=prov, model=model, api_key=key, fallback=fb)
         try:
             new = Answerer(self.cfg, notify=lambda m: self.post("info", m))
@@ -159,6 +162,29 @@ class App(Pipeline):
         self.fb_var.set(self.fallback_text())
         save_model_choice(self.cfg)
         self.add_line(f"Модель: {label}. {self.fallback_text().capitalize()}.", "info")
+
+    def open_settings(self, first_run=False):
+        if self.settings_win is not None:
+            try:
+                self.settings_win.win.lift()
+                return
+            except tk.TclError:
+                pass
+        self.settings_win = SettingsWindow(self.root, on_save=self.apply_settings, first_run=first_run)
+
+    def apply_settings(self, _raw):
+        """Застосувати збережені налаштування без перезапуску (крім звуку й способу розпізнавання)."""
+        self.cfg.clear()
+        self.cfg.update(load_config())     # той самий об'єкт — мова й терміни Whisper оновляться одразу
+        self.mode_var.set(self.cfg["answer_mode"])
+        if self.answerer is not None:
+            try:
+                self.answerer = Answerer(self.cfg, notify=lambda m: self.post("info", m))
+            except Exception as e:  # noqa: BLE001
+                self.add_line(f"Не вдалося підключити {self.cfg['provider']}: {e!r}", "info")
+        self.model_var.set(self.current_choice_label())
+        self.fb_var.set(self.fallback_text())
+        self.add_line("Налаштування збережено.", "info")
 
     def clear(self):
         self.text.delete("1.0", "end")

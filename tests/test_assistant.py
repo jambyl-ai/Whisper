@@ -261,3 +261,114 @@ class SwitchModelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------- налаштування
+from assistant import settings  # noqa: E402
+
+
+class FakeVar:
+    def __init__(self, value=None, **kw):
+        self.v = value
+
+    def get(self):
+        return self.v
+
+    def set(self, v):
+        self.v = v
+
+    def trace_add(self, *a):
+        pass
+
+
+class FakeWidget:
+    """Приймає будь-які виклики tkinter — для перевірки, що форма будується без помилок."""
+    def __init__(self, *a, **kw):
+        self.kw, self.text = kw, ""
+
+    def __getattr__(self, name):
+        return lambda *a, **kw: FakeWidget()
+
+    def __getitem__(self, k):
+        return FakeWidget()
+
+    def get(self, *a):
+        return self.text
+
+    def insert(self, _pos, text, *a):
+        self.text += text
+
+
+def fake_tk():
+    m = types.ModuleType("tkinter")
+    for n in ("Tk", "Toplevel", "Frame", "Label", "Button", "Entry", "Text", "OptionMenu", "Canvas",
+              "Scrollbar", "Checkbutton"):
+        setattr(m, n, FakeWidget)
+    m.StringVar = m.BooleanVar = FakeVar
+    m.TclError = RuntimeError
+    return m
+
+
+class SettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        shutil.copy(ROOT / "config.example.json", self.tmp)
+        self.patches = [mock.patch.object(settings, "HERE", self.tmp), mock.patch.object(settings, "tk", fake_tk()),
+                        mock.patch.object(settings, "speaker_names", lambda: ["Speakers (Realtek)", "Headphones"])]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        shutil.rmtree(self.tmp)
+
+    def test_apply_values_keeps_comments_and_sets_fallback(self):
+        raw = settings.read_raw()
+        v = {"user_name": " Іван ", "keys": {"groq": "gsk_1", "gemini": "AQ.2", "openai": ""},
+             "provider": "gemini", "model": "gemini-3.8-flash", "language": "en", "answer_mode": "all",
+             "answer_instructions": "Коротко\n", "whisper_prompt": "NX bit", "whisper_backend": "groq",
+             "output_device": "Headphones", "turn_gaps": (1.8, 3.5)}
+        out = settings.apply_values(raw, v)
+        self.assertEqual(out["user_name"], "Іван")
+        self.assertEqual(out["fallback"], {"provider": "groq", "model": "openai/gpt-oss-120b"})
+        self.assertEqual((out["turn_gap_seconds"], out["unfinished_gap_seconds"]), (1.8, 3.5))
+        self.assertEqual(out["api_key"], "")
+        self.assertIn("_1", out)                      # коментарі на місці
+        self.assertEqual(settings.speed_index(out), 2)
+
+    def test_check_key_messages(self):
+        import urllib.error
+
+        def opener_for(code):
+            def op(req, timeout):
+                if code == 200:
+                    return mock.MagicMock()
+                if code is None:
+                    raise OSError("offline")
+                raise urllib.error.HTTPError(req.full_url, code, "x", {}, None)
+            return op
+        self.assertTrue(settings.check_key("groq", "gsk_1", opener_for(200))[0])
+        self.assertIn("не підходить", settings.check_key("groq", "bad", opener_for(401))[1])
+        self.assertTrue(settings.check_key("gemini", "k", opener_for(429))[0])
+        self.assertIn("зв'язку", settings.check_key("openai", "k", opener_for(None))[1])
+        self.assertFalse(settings.check_key("groq", "  ")[0])
+
+    def test_window_builds_and_saves(self):
+        saved = []
+        w = settings.SettingsWindow(master=FakeWidget(), on_save=saved.append, first_run=True)
+        w.name_var.set("Оля")
+        w.key_vars["groq"].set("gsk_abc")
+        w.dev_var.set("Headphones")
+        w.speed_var.set(settings.SPEEDS[2][0])
+        w.save()
+        cfg = json.loads((self.tmp / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual((cfg["user_name"], cfg["keys"]["groq"], cfg["output_device"]), ("Оля", "gsk_abc", "Headphones"))
+        self.assertEqual(cfg["turn_gap_seconds"], 1.8)
+        self.assertEqual(len(saved), 1)
+
+    def test_standalone_without_config_uses_example(self):
+        w = settings.SettingsWindow()            # як 4_налаштування.bat
+        self.assertEqual(w.raw["provider"], "groq")
+        w.save()
+        self.assertTrue((self.tmp / "config.json").exists())

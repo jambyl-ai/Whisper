@@ -37,8 +37,9 @@ echo without a key - on the processor (model small).
 :done
 echo.
 echo ================================================================
-echo  Done. Get a FREE key at https://console.groq.com/keys
-echo  and paste it into config.json:  "keys": { "groq": "gsk_..." }
-echo  Then start 2_run.
+echo  Done. The settings window opens now: type your name and paste
+echo  a FREE Groq key (button "Get" opens console.groq.com/keys).
+echo  Later you can open it again with 4_settings. Then start 2_run.
 echo ================================================================
+".venv\Scripts\python.exe" whisper_assistant.py --setup
 pause

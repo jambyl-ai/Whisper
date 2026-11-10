@@ -107,3 +107,11 @@ def save_model_choice(cfg):
     raw["fallback"] = cfg.get("fallback") or {}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
+
+
+def pick_fallback(cfg, prov):
+    """Запасна модель: інша безкоштовна, для якої є ключ (платну запасною не ставимо)."""
+    for _, p, m in MODEL_CHOICES:
+        if p != prov and p != "openai" and key_for(cfg, p):
+            return {"provider": p, "model": m}
+    return {}
