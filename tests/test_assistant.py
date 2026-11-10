@@ -184,6 +184,14 @@ class AnswererTests(unittest.TestCase):
         a.cfg = make_cfg(user_name="")
         self.assertIn("для користувача.", a.system_prompt())
 
+    def test_prompt_separates_questions_about_user_and_things(self):
+        a = llm.Answerer.__new__(llm.Answerer)
+        a.profile, a.docs, a.cfg = "", [], make_cfg()
+        p = a.system_prompt()
+        self.assertIn("ПРО КОГО", p)
+        self.assertIn("«X is…»", p)
+        self.assertNotIn("від першої особи («I…», «Я…»).\nПравила", p)
+
 
 # ---------------------------------------------------------------- репліки
 class PipelineTests(unittest.TestCase):
