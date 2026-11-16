@@ -1,10 +1,91 @@
 """Відповіді: Gemini (рідний API), OpenAI-сумісні сервіси, Anthropic; запасна модель."""
 import json
+import math
+import re
 import socket
 import time
 
 from .config import OPENAI_COMPAT_BASES, key_for
 from .knowledge import load_profile_and_knowledge
+
+# Скільки токенів можна надіслати одним запитом. Безкоштовний Groq рахує ліміт за хвилину
+# (напр. 8000 TPM для gpt-oss-120b, сюди входить і max_tokens відповіді), тож туди йде лише
+# найпотрібніше. None — без обмеження (Gemini, Claude: великі ліміти).
+DEFAULT_PROMPT_BUDGET = {"groq": 5000, "ollama": 6000}
+
+
+def est_tokens(text):
+    """Груба оцінка з запасом: ~3 символи на токен (кирилиця «дорожча» за латиницю)."""
+    return len(text) // 3 + 1
+
+
+_WORD = re.compile(r"[^\W_]{2,}", re.U)
+_STOP = set("""
+the and what does did do is are was were be been you your yours it its of to in on for with this that these those
+how why when where who which can could would will shall should about me my mine we our they them their he him his
+she her an or at by as from have has had not no yes ok so if then than there here also just very please tell say
+що як це та ти ви він вона воно вони мене мені мій моя твій ваш чи по за до від для про але або так ні теж там тут
+що також коли де хто який яка яке які чому навіщо
+что как это ты вы он она оно они меня мне мой моя твой ваш ли по за до от для про но или да нет тоже там тут
+также когда где кто какой какая какое какие почему зачем
+""".split())
+
+
+def _words(text):
+    return {w.lower() for w in _WORD.findall(text)} - _STOP
+
+
+def chunk_text(name, text, size=900):
+    """Розбити документ на уривки ~size символів по абзацах."""
+    parts = [x.strip() for x in re.split(r"\n+", text) if x.strip()]
+    chunks, cur = [], ""
+    for para in parts:
+        while len(para) > size:                      # дуже довгий абзац
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(para[:size])
+            para = para[size:]
+        if cur and len(cur) + len(para) + 1 > size:
+            chunks.append(cur)
+            cur = ""
+        cur = f"{cur}\n{para}" if cur else para
+    if cur:
+        chunks.append(cur)
+    return [(name, i, c) for i, c in enumerate(chunks)]
+
+
+def select_chunks(docs, query, budget, last=""):
+    """Уривки з матеріалів, найближчі до питання, що вміщаються в budget токенів (у порядку тексту).
+
+    Оцінка — збіг слів з питанням, рідкісні слова важать більше (IDF), слова останньої
+    фрази — утричі. Повертає (уривки, чи довелось щось відкинути).
+    """
+    chunks = [c for name, text in docs for c in chunk_text(name, text)]
+    if not chunks or budget <= 0:
+        return [], bool(chunks)
+    sizes = [est_tokens(c[2]) + 8 for c in chunks]
+    if sum(sizes) <= budget:
+        return chunks, False
+    cw = [_words(c[2]) for c in chunks]
+    df = {}
+    for ws in cw:
+        for w in ws:
+            df[w] = df.get(w, 0) + 1
+    n = len(chunks)
+    qlast, qall = _words(last), _words(query)
+    q = qlast | qall
+
+    def score(i):
+        return sum(math.log((n + 1) / (df[w] + 0.5)) * (3 if w in qlast else 1) for w in q & cw[i])
+
+    ranked = sorted(range(n), key=lambda i: (-score(i), i))
+    picked, used = [], 0
+    for i in ranked:
+        if used + sizes[i] <= budget:
+            picked.append(i)
+            used += sizes[i]
+    return [chunks[i] for i in sorted(picked)], True
 
 
 class GeminiNative:
@@ -143,7 +224,7 @@ class Answerer:
         self.profile, self.docs, self.load_errors = load_profile_and_knowledge(self.cfg)
         return len(self.docs)
 
-    def system_prompt(self):
+    def system_prompt(self, query="", budget=None, last=""):
         name = (self.cfg.get("user_name") or "").strip()
         who = f"користувача, якого звати {name}" if name else "користувача"
         s = (f"Ти — підказувач для {who}. "
@@ -182,32 +263,95 @@ class Answerer:
             s += "\n\nДодаткові вимоги до відповіді: " + self.cfg["answer_instructions"]
         if self.cfg.get("context"):
             s += "\n\nДодатковий контекст: " + self.cfg["context"]
-        if self.profile:
-            s += "\n\n=== ПРОФІЛЬ (про користувача) ===\n" + self.profile
-        for name, text in self.docs:
-            s += f"\n\n=== МАТЕРІАЛ: {name} ===\n{text}"
+        if budget is None:
+            if self.profile:
+                s += "\n\n=== ПРОФІЛЬ (про користувача) ===\n" + self.profile
+            for name, text in self.docs:
+                s += f"\n\n=== МАТЕРІАЛ: {name} ===\n{text}"
+            return s
+        left = budget - est_tokens(s)
+        if self.profile and left > 0:
+            prof = self.profile
+            cap = max(300, left // 3)
+            if est_tokens(prof) > cap:
+                prof = prof[:cap * 3].rsplit("\n", 1)[0] + "\n…"
+            s += "\n\n=== ПРОФІЛЬ (про користувача) ===\n" + prof
+            left = budget - est_tokens(s)
+        picked, cut = select_chunks(self.docs, query, left - 60, last)
+        if picked:
+            s += "\n\n=== МАТЕРІАЛИ ===" + ("\n(через ліміт сервера — лише уривки, найближчі до питання)" if cut else "")
+            last = None
+            for name, _i, text in picked:
+                if name != last:
+                    s += f"\n\n--- {name} ---"
+                    last = name
+                s += "\n" + text
         return s
 
-    def stream(self, history, force=False):
-        """Генератор шматків відповіді."""
-        convo = "\n".join(f"- {h}" for h in history[:-1]) or "(немає)"
-        user = f"Попередні фрази:\n{convo}\n\nОстання фраза:\n{history[-1]}"
+    @staticmethod
+    def budget_for(cfg):
+        b = cfg.get("prompt_budget_tokens")
+        if isinstance(b, dict):
+            b = b.get(cfg.get("provider"))
+        if b in (None, "", 0):
+            b = DEFAULT_PROMPT_BUDGET.get(cfg.get("provider"))
+        return int(b) if b else None
+
+    @staticmethod
+    def user_part(history, force=False, budget=None):
+        """Історія для моделі; з budget — найновіші фрази, що вміщаються."""
+        last, prev = history[-1], list(history[:-1])
+        if budget is not None:
+            last = last[-1500:]
+            used, keep = est_tokens(last) + 80, []
+            for h in reversed(prev):
+                h = h if len(h) <= 400 else h[:400] + "…"
+                t = est_tokens(h) + 2
+                if used + t > budget:
+                    break
+                keep.append(h)
+                used += t
+            prev = keep[::-1]
+        convo = "\n".join(f"- {h}" for h in prev) or "(немає)"
+        user = f"Попередні фрази:\n{convo}\n\nОстання фраза:\n{last}"
         if force:
             user += "\n\nКористувач сам попросив відповідь: дай найкращу відповідь або коментар, не NONE."
-        system = self.system_prompt()
+        return user
+
+    def prompt_for(self, pair, history, force=False, shrink=1):
+        budget = self.budget_for(pair[1])
+        if budget is not None:
+            budget = max(1500, int(budget / shrink))
+        user = self.user_part(history, force, None if budget is None else max(500, budget // 4))
+        query = " ".join(history[-4:])
+        system = self.system_prompt(query=query, budget=None if budget is None else budget - est_tokens(user),
+                                    last=history[-1])
+        return system, user
+
+    def stream(self, history, force=False):
+        """Генератор шматків відповіді. Кожен сервер отримує запит під свій ліміт."""
         first = self.main or self.backup
         got = False
-        try:
-            for t in self._stream(first, system, user):
-                got = True
-                yield t
-            return
-        except Exception as e:  # noqa: BLE001
-            if got or not self.backup or first is self.backup:
-                raise
-            why = str(e).replace("\n", " ")[:220]
+        shrink = 1
+        while True:
+            system, user = self.prompt_for(first, history, force, shrink)
+            try:
+                for t in self._stream(first, system, user):
+                    got = True
+                    yield t
+                return
+            except Exception as e:  # noqa: BLE001
+                too_big = "413" in str(e) or "too large" in str(e).lower()
+                if not got and too_big and shrink < 4 and (not self.backup or first is self.backup):
+                    shrink *= 2            # запасного немає — пробуємо коротший запит
+                    continue
+                if got or not self.backup or first is self.backup:
+                    raise
+                why = str(e).replace("\n", " ")[:220]
+                break
         self.notify(f"Основний сервер ({first[1]['model']}) не відповів — відповідаю через запасний "
                     f"({self.backup[1]['model']}). Причина: {why}")
+        system, user = self.prompt_for(self.backup, history, force)
         yield from self._stream(self.backup, system, user)
 
     @staticmethod

@@ -15,6 +15,7 @@ DEFAULT_CONFIG = {
     "model": "openai/gpt-oss-120b",
     "reasoning_effort": "low",
     "fallback": {"provider": "gemini", "model": "gemini-3.8-flash"},
+    "prompt_budget_tokens": {"groq": 5000, "ollama": 6000},  # ліміт запиту; інші — без обмеження
     "base_url": "",
     "whisper_backend": "auto",         # auto: NVIDIA → локально; інакше хмара Groq (якщо є ключ) або процесор
     "cloud_whisper_model": "whisper-large-v3-turbo",

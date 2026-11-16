@@ -167,7 +167,7 @@ class AnswererTests(unittest.TestCase):
         with mock.patch.object(llm, "GeminiNative", object):
             a = llm.Answerer.__new__(llm.Answerer)
         a.notify, a.cfg = notes.append, make_cfg()
-        a.system_prompt = lambda: ""
+        a.system_prompt = lambda *args, **kw: ""
         with mock.patch.object(llm, "GeminiNative", (Fail, Ok)):
             a.main = (Fail(), {"provider": "gemini", "model": "main"})
             a.backup = (Ok(), {"provider": "gemini", "model": "backup"})
@@ -193,6 +193,46 @@ class AnswererTests(unittest.TestCase):
         self.assertIn("«X is…»", p)
         self.assertNotIn("від першої особи («I…», «Я…»).\nПравила", p)
 
+
+    def _big_answerer(self, provider="groq"):
+        a = llm.Answerer.__new__(llm.Answerer)
+        a.cfg = make_cfg(provider=provider)
+        a.profile = "Профіль: студент КНУ. " * 40
+        filler = "\n".join(f"Paragraph {i}: generic text about networks and radio waves." for i in range(600))
+        a.docs = [("lecture.txt", filler + "\nThe NX bit marks data pages as non-executable.\n" + filler)]
+        return a
+
+    def test_groq_prompt_fits_limit_and_keeps_relevant_part(self):
+        a = self._big_answerer()
+        hist = [f"phrase {i} " * 30 for i in range(20)] + ["What does the NX bit do?"]
+        system, user = a.prompt_for((None, a.cfg), hist)
+        self.assertLessEqual(llm.est_tokens(system) + llm.est_tokens(user), 5000 + 100)
+        self.assertIn("NX bit marks data pages", system)      # потрібний уривок знайдено
+        self.assertIn("What does the NX bit do?", user)       # останнє питання завжди є
+
+    def test_gemini_gets_everything(self):
+        a = self._big_answerer()
+        cfg = dict(a.cfg, provider="gemini")
+        system, _ = a.prompt_for((None, cfg), ["What does the NX bit do?"])
+        self.assertIn("Paragraph 599", system)
+        self.assertGreater(llm.est_tokens(system), 20000)
+
+    def test_413_without_backup_retries_smaller(self):
+        sizes = []
+
+        class Big:
+            def stream(self, system, user):
+                sizes.append(llm.est_tokens(system))
+                if len(sizes) == 1:
+                    raise RuntimeError("Error code: 413 - Request too large ... tokens per minute (TPM)")
+                yield "OK"
+
+        a = self._big_answerer()
+        a.notify = lambda m: None
+        with mock.patch.object(llm, "GeminiNative", Big):
+            a.main, a.backup = (Big(), dict(a.cfg, provider="gemini", prompt_budget_tokens={"gemini": 6000})), None
+            self.assertEqual(list(a.stream(["What does the NX bit do?"])), ["OK"])
+        self.assertLess(sizes[1], sizes[0])
 
 # ---------------------------------------------------------------- репліки
 class PipelineTests(unittest.TestCase):

@@ -19,6 +19,11 @@
     "provider": "gemini",
     "model": "gemini-3.8-flash"
   },
+  "_prompt_budget": "prompt_budget_tokens: скільки токенів максимум іде в один запит (профіль, уривки зі «знань», історія). Безкоштовний Groq має ліміт 8000 токенів/хв, тож 5000; сервіси, яких тут немає (Gemini, Claude), отримують усе.",
+  "prompt_budget_tokens": {
+    "groq": 5000,
+    "ollama": 6000
+  },
   "_whisper_backend": "whisper_backend: auto — відеокарта NVIDIA, якщо є; інакше хмара Groq (той самий ключ groq); інакше процесор. local — лише на цьому ПК. groq — завжди в хмарі.",
   "whisper_backend": "auto",
   "cloud_whisper_model": "whisper-large-v3-turbo",
